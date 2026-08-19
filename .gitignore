@@ -1,0 +1,18 @@
+# Python cache and local test output
+__pycache__/
+*.py[cod]
+*.log
+validation_*.txt
+
+# Temporary corpus authoring batches and one-time local repair helpers
+batch_*.jsonl
+build_dataset.py
+correct_*.py
+
+# Local archives and scratch artifacts
+*.zip
+*.corrected.jsonl
+*.case_corrected.jsonl
+
+# Local development metadata
+.git/
