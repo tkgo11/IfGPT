@@ -131,6 +131,12 @@ class ValidateTests(unittest.TestCase):
         self.assertTrue(any("record count is 3" in e for e in errors))
         self.assertTrue(any("outside expected range" in e for e in errors))
 
+    def test_huge_expected_count_does_not_hang(self) -> None:
+        # The id-range check must not materialize set(range(1, N + 1)).
+        errors = self.validate_records([record(1)], expected_count=10**9)
+        self.assertTrue(any("record count is 1" in e for e in errors))
+        self.assertTrue(any("missing ids" in e for e in errors))
+
     def test_unopenable_file(self) -> None:
         errors = vd.validate(Path("/nonexistent/missing.jsonl"))
         self.assertEqual(len(errors), 1)
