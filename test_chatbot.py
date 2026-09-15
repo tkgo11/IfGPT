@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -220,6 +221,10 @@ class RespondTests(unittest.TestCase):
             "I am a small rule-based chatbot using a separate JSONL conversation file.",
         )
 
+    def test_non_string_message_rejected(self) -> None:
+        with self.assertRaises((TypeError, AttributeError)):
+            chatbot.respond(None, self.conversations)  # type: ignore[arg-type]
+
     def test_generic_fallback(self) -> None:
         response = chatbot.respond(
             "please compose a sonnet about an orbital telescope", self.conversations
@@ -321,13 +326,37 @@ class CliTests(unittest.TestCase):
 
     def test_closed_stdin_exits_cleanly(self) -> None:
         result = subprocess.run(
-            ["bash", "-c", f"exec 0<&-; {sys.executable} {CHATBOT}"],
+            [
+                "bash",
+                "-c",
+                f"exec 0<&-; {shlex.quote(sys.executable)} {shlex.quote(str(CHATBOT))}",
+            ],
             capture_output=True,
             text=True,
             timeout=30,
         )
         self.assertEqual(result.returncode, 0)
         self.assertIn("Goodbye.", result.stdout)
+
+    def test_stdout_closed_at_exec_exits_cleanly(self) -> None:
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                f"{shlex.quote(sys.executable)} {shlex.quote(str(CHATBOT))} hi >&-",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_dash_prefixed_message_after_separator(self) -> None:
+        result = run_cli("--", "-hello")
+        self.assertEqual(result.returncode, 0)
+        self.assertTrue(result.stdout.endswith("\n"))
+        self.assertNotIn("usage:", result.stdout)
 
     def test_strict_stdin_invalid_utf8_exits_cleanly(self) -> None:
         env = {**os.environ, "PYTHONIOENCODING": "utf-8:strict"}
@@ -349,7 +378,9 @@ class CliTests(unittest.TestCase):
         )
         assert proc.stdout is not None
         proc.stdout.close()
-        stderr = proc.stderr.read() if proc.stderr else b""
+        assert proc.stderr is not None
+        stderr = proc.stderr.read()
+        proc.stderr.close()
         proc.wait(timeout=30)
         self.assertEqual(proc.returncode, 0)
         self.assertNotIn(b"Broken pipe", stderr)

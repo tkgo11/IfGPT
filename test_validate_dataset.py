@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -37,8 +38,8 @@ class ComparisonFormTests(unittest.TestCase):
                 self.assertIn(expected, vd.comparison_form_error(text) or "")
 
     def test_agrees_with_chatbot_normalize_on_corpus(self) -> None:
-        # comparison_form_error(m) is None iff normalize(m) == m; both must
-        # hold for every stored message (H3).
+        # Every stored message must already be in comparison form, i.e.
+        # applying live-input normalization changes nothing.
         for message in chatbot.load_conversations():
             self.assertIsNone(vd.comparison_form_error(message))
             self.assertEqual(chatbot.normalize_live_input(message), message)
@@ -223,6 +224,52 @@ class CliTests(unittest.TestCase):
         result = self.run_cli("--expected-count", "0")
         self.assertEqual(result.returncode, 2)
         self.assertIn("positive integer", result.stderr)
+
+    def test_noninteger_expected_count(self) -> None:
+        result = self.run_cli("--expected-count", "abc")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("invalid int value", result.stderr)
+
+    def test_surrogate_user_message_flagged(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data_file = Path(directory) / "data.jsonl"
+            data_file.write_text(
+                '{"id":1,"category":"t","user_message":"\\ud800",'
+                '"assistant_response":"ok"}\n',
+                encoding="utf-8",
+            )
+            errors = vd.validate(data_file, expected_count=1)
+        self.assertTrue(any("not UTF-8 encodable" in e for e in errors))
+
+    def test_stdout_closed_at_exec_exits_cleanly(self) -> None:
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                f"{shlex.quote(sys.executable)} {shlex.quote(str(VALIDATOR))} >&-",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_broken_pipe_exits_cleanly(self) -> None:
+        proc = subprocess.Popen(
+            [sys.executable, str(VALIDATOR)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert proc.stdout is not None
+        proc.stdout.close()
+        assert proc.stderr is not None
+        stderr = proc.stderr.read()
+        proc.stderr.close()
+        proc.wait(timeout=30)
+        self.assertEqual(proc.returncode, 0)
+        self.assertNotIn(b"Broken pipe", stderr)
+        self.assertNotIn(b"Exception", stderr)
 
     def test_help_flag(self) -> None:
         result = self.run_cli("--help")
