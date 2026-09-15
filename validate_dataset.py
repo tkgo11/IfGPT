@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import re
 import unicodedata
@@ -115,13 +116,20 @@ def validate(data_file: Path, expected_count: int = 2400) -> list[str]:
     if record_count != expected_count:
         errors.append(f"record count is {record_count}; expected {expected_count}")
     if seen_ids:
-        expected_ids = set(range(1, expected_count + 1))
-        missing_ids = sorted(expected_ids - set(seen_ids))
-        extra_ids = sorted(set(seen_ids) - expected_ids)
+        # Lazy range checks: never materialize or iterate range(1, N + 1)
+        # when --expected-count is large. islice stops after the first 10
+        # ascending missing ids; extras iterate the small seen set.
+        missing_ids = list(
+            itertools.islice(
+                (i for i in range(1, expected_count + 1) if i not in seen_ids),
+                10,
+            )
+        )
+        extra_ids = sorted(i for i in seen_ids if not 1 <= i <= expected_count)[:10]
         if missing_ids:
-            errors.append(f"missing ids: {missing_ids[:10]}")
+            errors.append(f"missing ids: {missing_ids}")
         if extra_ids:
-            errors.append(f"ids outside expected range: {extra_ids[:10]}")
+            errors.append(f"ids outside expected range: {extra_ids}")
 
     return errors
 
