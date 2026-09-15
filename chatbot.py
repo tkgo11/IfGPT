@@ -10,8 +10,8 @@ from __future__ import annotations
 import json
 import re
 import unicodedata
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Mapping
 
 DATA_FILE = Path(__file__).with_name("conversations.jsonl")
 PUNCTUATION_RE = re.compile(r"[^\w\s]", flags=re.UNICODE)
@@ -76,7 +76,9 @@ def load_conversations(data_file: Path | str = DATA_FILE) -> dict[str, str]:
             if not isinstance(record["user_message"], str) or not isinstance(
                 record["assistant_response"], str
             ):
-                raise DatasetError(f"Non-string conversation text at line {line_number}.")
+                raise DatasetError(
+                    f"Non-string conversation text at line {line_number}."
+                )
             if record["user_message"] in conversations:
                 raise DatasetError(
                     f"Duplicate user_message at line {line_number}: "
@@ -106,7 +108,9 @@ def respond(message: str, conversations: Mapping[str, str] | None = None) -> str
     elif normalized in EXIT_COMMANDS:
         return "Goodbye."
     elif normalized in GREETINGS:
-        return "Hello. Ask me a question or describe something you would like help with."
+        return (
+            "Hello. Ask me a question or describe something you would like help with."
+        )
     elif normalized in THANKS:
         return "You are welcome."
     elif normalized in FAREWELLS:
@@ -117,7 +121,9 @@ def respond(message: str, conversations: Mapping[str, str] | None = None) -> str
             "handle basic greetings, thanks, help, and exit commands."
         )
     elif normalized in IDENTITY_QUESTIONS:
-        return "I am a small rule-based chatbot using a separate JSONL conversation file."
+        return (
+            "I am a small rule-based chatbot using a separate JSONL conversation file."
+        )
     elif normalized in conversations:
         # Lookup is exact against the authored, untouched corpus key.
         return conversations[normalized]
