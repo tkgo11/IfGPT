@@ -160,6 +160,16 @@ class ValidateTests(unittest.TestCase):
         self.assertEqual(len(errors), 1)
         self.assertIn("Could not open", errors[0])
 
+    def test_str_path_accepted(self) -> None:
+        errors = vd.validate("/nonexistent/missing.jsonl")
+        self.assertEqual(len(errors), 1)
+        self.assertIn("Could not open", errors[0])
+
+    def test_nul_byte_path_reported(self) -> None:
+        errors = vd.validate(Path("bad\0name.jsonl"))
+        self.assertEqual(len(errors), 1)
+        self.assertIn("Could not open", errors[0])
+
     def test_non_utf8_file(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             data_file = Path(directory) / "data.jsonl"
@@ -267,7 +277,8 @@ class CliTests(unittest.TestCase):
         stderr = proc.stderr.read()
         proc.stderr.close()
         proc.wait(timeout=30)
-        self.assertEqual(proc.returncode, 0)
+        # Non-zero: a validator must not mask a lost report as success.
+        self.assertEqual(proc.returncode, 1)
         self.assertNotIn(b"Broken pipe", stderr)
         self.assertNotIn(b"Exception", stderr)
 
