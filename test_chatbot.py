@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import ClassVar
 
 import chatbot
+from fixtures import record, write_jsonl
 
 CHATBOT = Path(__file__).resolve().with_name("chatbot.py")
 
@@ -31,30 +32,6 @@ def run_cli(
         cwd=cwd,
         timeout=30,
     )
-
-
-def write_jsonl(
-    directory: Path, records: list[object], name: str = "data.jsonl"
-) -> Path:
-    data_file = directory / name
-    data_file.write_text(
-        "".join(json.dumps(r) + "\n" for r in records), encoding="utf-8"
-    )
-    return data_file
-
-
-def record(
-    record_id: object = 1,
-    category: object = "test",
-    user_message: object = "sample prompt",
-    assistant_response: object = "sample response",
-) -> dict[str, object]:
-    return {
-        "id": record_id,
-        "category": category,
-        "user_message": user_message,
-        "assistant_response": assistant_response,
-    }
 
 
 class NormalizeTests(unittest.TestCase):
