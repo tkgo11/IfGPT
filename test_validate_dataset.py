@@ -13,22 +13,9 @@ from pathlib import Path
 
 import chatbot
 import validate_dataset as vd
+from fixtures import record, write_jsonl
 
 VALIDATOR = Path(__file__).resolve().with_name("validate_dataset.py")
-
-
-def record(
-    record_id: object = 1,
-    category: object = "test",
-    user_message: object = "sample prompt",
-    assistant_response: object = "sample response",
-) -> dict[str, object]:
-    return {
-        "id": record_id,
-        "category": category,
-        "user_message": user_message,
-        "assistant_response": assistant_response,
-    }
 
 
 class ComparisonFormTests(unittest.TestCase):
@@ -60,11 +47,7 @@ class ValidateTests(unittest.TestCase):
         self, records: list[object], expected_count: int | None = None
     ) -> list[str]:
         with tempfile.TemporaryDirectory() as directory:
-            data_file = Path(directory) / "data.jsonl"
-            data_file.write_text(
-                "".join(json.dumps(r) + "\n" for r in records),
-                encoding="utf-8",
-            )
+            data_file = write_jsonl(Path(directory), records)
             if expected_count is None:
                 return vd.validate(data_file)
             return vd.validate(data_file, expected_count=expected_count)
