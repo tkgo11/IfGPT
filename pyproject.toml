@@ -1,0 +1,15 @@
+[project]
+name = "ifgpt"
+version = "0.1.0"
+description = "Rule-based JSONL chatbot with a directly authored conversation corpus"
+requires-python = ">=3.10"
+
+[tool.ruff]
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM", "EXE", "RUF"]
+
+[tool.mypy]
+strict = true
+files = ["chatbot.py", "validate_dataset.py", "test_chatbot.py"]

@@ -60,7 +60,8 @@ def validate(data_file: Path, expected_count: int = 2400) -> list[str]:
                 continue
             if set(record) != REQUIRED_FIELDS:
                 errors.append(
-                    f"line {line_number}: fields must be exactly {sorted(REQUIRED_FIELDS)}"
+                    f"line {line_number}: fields must be exactly "
+                    f"{sorted(REQUIRED_FIELDS)}"
                 )
                 continue
 
@@ -68,7 +69,11 @@ def validate(data_file: Path, expected_count: int = 2400) -> list[str]:
             category = record["category"]
             message = record["user_message"]
             response = record["assistant_response"]
-            if not isinstance(record_id, int) or isinstance(record_id, bool) or record_id < 1:
+            if (
+                not isinstance(record_id, int)
+                or isinstance(record_id, bool)
+                or record_id < 1
+            ):
                 errors.append(f"line {line_number}: id must be a positive integer")
             elif record_id in seen_ids:
                 errors.append(
@@ -79,9 +84,13 @@ def validate(data_file: Path, expected_count: int = 2400) -> list[str]:
                 seen_ids[record_id] = line_number
 
             if not isinstance(category, str) or not category.strip():
-                errors.append(f"line {line_number}: category must be a non-empty string")
+                errors.append(
+                    f"line {line_number}: category must be a non-empty string"
+                )
             if not isinstance(message, str) or not message:
-                errors.append(f"line {line_number}: user_message must be a non-empty string")
+                errors.append(
+                    f"line {line_number}: user_message must be a non-empty string"
+                )
             else:
                 form_error = comparison_form_error(message)
                 if form_error:
@@ -94,7 +103,9 @@ def validate(data_file: Path, expected_count: int = 2400) -> list[str]:
                 else:
                     seen_messages[message] = line_number
             if not isinstance(response, str) or not response.strip():
-                errors.append(f"line {line_number}: assistant_response must be a non-empty string")
+                errors.append(
+                    f"line {line_number}: assistant_response must be a non-empty string"
+                )
 
     if record_count != expected_count:
         errors.append(f"record count is {record_count}; expected {expected_count}")
@@ -119,7 +130,10 @@ def main() -> int:
             print(f"- {error}")
         return 1
 
-    print("VALIDATION PASSED: 2400 records, unique ids and prompts, valid schema, valid comparison form.")
+    print(
+        "VALIDATION PASSED: 2400 records, unique ids and prompts, "
+        "valid schema, valid comparison form."
+    )
     return 0
 
 
