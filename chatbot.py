@@ -8,6 +8,7 @@ and compared exactly as they appear in ``conversations.jsonl``.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import re
@@ -60,7 +61,8 @@ def load_conversations(data_file: Path | str = DATA_FILE) -> dict[str, str]:
 
     try:
         source = path.open("r", encoding="utf-8")
-    except OSError as error:
+    except (OSError, ValueError) as error:
+        # OSError: missing/unreadable file; ValueError: e.g. embedded NUL.
         raise DatasetError(f"Could not open data file '{path}': {error}") from error
 
     with source:
@@ -183,16 +185,20 @@ def main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv)
     for stream in (sys.stdout, sys.stderr):
         # Replace unencodable output instead of crashing on narrow locales.
-        if hasattr(stream, "reconfigure"):
-            stream.reconfigure(errors="replace")
+        # Suppressed when the stream is None, closed, or lacks reconfigure.
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            with contextlib.suppress(ValueError, OSError):
+                reconfigure(errors="replace")
     try:
         conversations = load_conversations()
     except DatasetError as error:
-        print(f"Data warning: {error}", file=sys.stderr)
-        print(
-            "The chatbot will continue with basic rule-based responses only.",
-            file=sys.stderr,
-        )
+        if sys.stderr is not None:
+            print(f"Data warning: {error}", file=sys.stderr)
+            print(
+                "The chatbot will continue with basic rule-based responses only.",
+                file=sys.stderr,
+            )
         conversations = {}
 
     if args.message is not None:
@@ -207,10 +213,17 @@ def main(argv: list[str] | None = None) -> None:
         except (EOFError, KeyboardInterrupt):
             print("\nGoodbye.")
             break
-        except (OSError, RuntimeError, ValueError, MemoryError) as error:
-            # Closed/lost stdin, undecodable input, or out of memory while
-            # reading a line all end the session rather than crash.
-            print(f"\nInput error: {error}", file=sys.stderr)
+        except (
+            OSError,
+            RuntimeError,
+            ValueError,
+            AttributeError,
+            MemoryError,
+        ) as error:
+            # Closed/lost/odd stdin, undecodable input, or out of memory
+            # while reading a line all end the session rather than crash.
+            if sys.stderr is not None:
+                print(f"\nInput error: {error}", file=sys.stderr)
             print("Goodbye.")
             break
 
@@ -222,19 +235,21 @@ def main(argv: list[str] | None = None) -> None:
 if __name__ == "__main__":
     try:
         main()
-        # stdout is block-buffered on pipes; flush now so a downstream-
-        # closed pipe raises here, inside the handler's reach. stdout is
-        # None when fd 1 was closed at exec; print() no-ops but flush()
-        # would raise AttributeError.
+        # stdout is block-buffered on pipes; flush now so a downstream
+        # write failure raises here, inside the handler's reach. stdout
+        # is None when fd 1 was closed at exec; print() no-ops but
+        # flush() would raise AttributeError.
         if sys.stdout is not None:
             sys.stdout.flush()
-    except BrokenPipeError:
-        # stdout was closed early (e.g. piped into `head`). Redirect the
-        # file descriptor so interpreter shutdown does not re-raise.
-        try:
-            devnull = os.open(os.devnull, os.O_WRONLY)
-            os.dup2(devnull, sys.stdout.fileno())
-            os.close(devnull)
-        except (AttributeError, OSError):
-            pass
+    except OSError:
+        # Output fd is dead: closed early (dead pipe, `| head`), full
+        # device, or reset socket. Redirect both fds so interpreter
+        # shutdown does not re-raise, then exit cleanly.
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                devnull = os.open(os.devnull, os.O_WRONLY)
+                os.dup2(devnull, stream.fileno())
+                os.close(devnull)
+            except (AttributeError, OSError):
+                pass
         raise SystemExit(0) from None

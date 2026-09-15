@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import importlib.util
 import itertools
 import json
@@ -40,8 +41,8 @@ if _CHATBOT_PATH.is_file():
                 | _chatbot.HELP_REQUESTS
                 | _chatbot.IDENTITY_QUESTIONS
             )
-    except Exception:
-        pass
+    except (Exception, SystemExit):
+        pass  # best-effort diagnostic; a broken sibling must not kill us
 
 
 def comparison_form_error(text: str) -> str | None:
@@ -62,9 +63,10 @@ def comparison_form_error(text: str) -> str | None:
 
 
 def validate(
-    data_file: Path, expected_count: int = DEFAULT_EXPECTED_COUNT
+    data_file: Path | str, expected_count: int = DEFAULT_EXPECTED_COUNT
 ) -> list[str]:
     """Return every schema, uniqueness, ID, and comparison-form error found."""
+    data_file = Path(data_file)
     if (
         not isinstance(expected_count, int)
         or isinstance(expected_count, bool)
@@ -79,7 +81,8 @@ def validate(
 
     try:
         source = data_file.open("r", encoding="utf-8")
-    except OSError as error:
+    except (OSError, ValueError) as error:
+        # OSError: missing/unreadable file; ValueError: e.g. embedded NUL.
         return [f"Could not open '{data_file}': {error}"]
 
     try:
@@ -229,6 +232,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
+    for stream in (sys.stdout, sys.stderr):
+        # Replace unencodable output instead of crashing on narrow locales
+        # or surrogate-escaped filenames in error text. Suppressed when the
+        # stream is None, closed, or lacks reconfigure.
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            with contextlib.suppress(ValueError, OSError):
+                reconfigure(errors="replace")
     errors = validate(args.data_file, expected_count=args.expected_count)
     if errors:
         print(f"VALIDATION FAILED: {len(errors)} issue(s)")
@@ -247,20 +258,23 @@ def main(argv: list[str] | None = None) -> int:
 if __name__ == "__main__":
     try:
         exit_code = main()
-        # stdout is block-buffered on pipes; flush now so a downstream-
-        # closed pipe raises here, inside the handler's reach. stdout is
-        # None when fd 1 was closed at exec; print() no-ops but flush()
-        # would raise AttributeError.
+        # stdout is block-buffered on pipes; flush now so a downstream
+        # write failure raises here, inside the handler's reach. stdout
+        # is None when fd 1 was closed at exec; print() no-ops but
+        # flush() would raise AttributeError.
         if sys.stdout is not None:
             sys.stdout.flush()
-    except BrokenPipeError:
-        # stdout was closed early (e.g. piped into `head`). Redirect the
-        # file descriptor so interpreter shutdown does not re-raise.
-        try:
-            devnull = os.open(os.devnull, os.O_WRONLY)
-            os.dup2(devnull, sys.stdout.fileno())
-            os.close(devnull)
-        except (AttributeError, OSError):
-            pass
-        raise SystemExit(0) from None
+    except OSError:
+        # Output fd is dead: closed early (dead pipe, `| head`), full
+        # device, or reset socket. Redirect both fds so interpreter
+        # shutdown does not re-raise. Exit non-zero: a validator must
+        # not mask a lost report (and any real verdict) as success.
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                devnull = os.open(os.devnull, os.O_WRONLY)
+                os.dup2(devnull, stream.fileno())
+                os.close(devnull)
+            except (AttributeError, OSError):
+                pass
+        raise SystemExit(1) from None
     raise SystemExit(exit_code)
