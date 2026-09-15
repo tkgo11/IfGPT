@@ -7,8 +7,10 @@ and compared exactly as they appear in ``conversations.jsonl``.
 
 from __future__ import annotations
 
+import argparse
 import json
 import re
+import sys
 import unicodedata
 from collections.abc import Mapping
 from pathlib import Path
@@ -16,9 +18,10 @@ from pathlib import Path
 DATA_FILE = Path(__file__).with_name("conversations.jsonl")
 PUNCTUATION_RE = re.compile(r"[^\w\s]", flags=re.UNICODE)
 WHITESPACE_RE = re.compile(r"\s+")
+REQUIRED_FIELDS = {"id", "category", "user_message", "assistant_response"}
 
 GREETINGS = {"hello", "hi", "hey", "good morning", "good afternoon", "good evening"}
-FAREWELLS = {"goodbye", "bye", "see you", "see you later", "farewell"}
+FAREWELLS = {"see you", "see you later", "farewell"}
 THANKS = {"thanks", "thank you", "thanks a lot", "thank you very much"}
 EXIT_COMMANDS = {"quit", "exit", "bye", "goodbye", "stop"}
 HELP_REQUESTS = {
@@ -60,33 +63,37 @@ def load_conversations(data_file: Path | str = DATA_FILE) -> dict[str, str]:
         raise DatasetError(f"Could not open data file '{path}': {error}") from error
 
     with source:
-        for line_number, line in enumerate(source, start=1):
-            if not line.strip():
-                raise DatasetError(f"Blank record at line {line_number}.")
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError as error:
-                raise DatasetError(
-                    f"Invalid JSON at line {line_number}: {error.msg}"
-                ) from error
+        try:
+            for line_number, line in enumerate(source, start=1):
+                if not line.strip():
+                    raise DatasetError(f"Blank record at line {line_number}.")
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError as error:
+                    raise DatasetError(
+                        f"Invalid JSON at line {line_number}: {error.msg}"
+                    ) from error
 
-            required_fields = {"id", "category", "user_message", "assistant_response"}
-            if not isinstance(record, dict) or not required_fields.issubset(record):
-                raise DatasetError(f"Invalid record schema at line {line_number}.")
-            if not isinstance(record["user_message"], str) or not isinstance(
-                record["assistant_response"], str
-            ):
-                raise DatasetError(
-                    f"Non-string conversation text at line {line_number}."
-                )
-            if record["user_message"] in conversations:
-                raise DatasetError(
-                    f"Duplicate user_message at line {line_number}: "
-                    f"{record['user_message']!r}"
-                )
+                if not isinstance(record, dict) or not REQUIRED_FIELDS.issubset(record):
+                    raise DatasetError(f"Invalid record schema at line {line_number}.")
+                if not isinstance(record["user_message"], str) or not isinstance(
+                    record["assistant_response"], str
+                ):
+                    raise DatasetError(
+                        f"Non-string conversation text at line {line_number}."
+                    )
+                if record["user_message"] in conversations:
+                    raise DatasetError(
+                        f"Duplicate user_message at line {line_number}: "
+                        f"{record['user_message']!r}"
+                    )
 
-            # Important: do not normalize, alter, or rewrite stored data here.
-            conversations[record["user_message"]] = record["assistant_response"]
+                # Important: do not normalize, alter, or rewrite stored data here.
+                conversations[record["user_message"]] = record["assistant_response"]
+        except UnicodeDecodeError as error:
+            raise DatasetError(
+                f"Data file '{path}' is not valid UTF-8: {error}"
+            ) from error
 
     return conversations
 
@@ -101,8 +108,11 @@ def respond(message: str, conversations: Mapping[str, str] | None = None) -> str
     if conversations is None:
         conversations = {}
 
-    normalized = normalize_live_input(message)
+    return _respond_normalized(normalize_live_input(message), conversations)
 
+
+def _respond_normalized(normalized: str, conversations: Mapping[str, str]) -> str:
+    """Return a response for an already-normalized message."""
     if not normalized:
         return "Please enter a message so I can respond."
     elif normalized in EXIT_COMMANDS:
@@ -134,14 +144,34 @@ def respond(message: str, conversations: Mapping[str, str] | None = None) -> str
         )
 
 
-def main() -> None:
-    """Run the interactive command-line chatbot."""
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Rule-based chatbot backed by a separate JSONL corpus."
+    )
+    parser.add_argument(
+        "message",
+        nargs="?",
+        help="single message to answer; omit to start an interactive session",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Run the chatbot: one-shot when a message is given, else interactive."""
+    args = _parse_args(argv)
     try:
         conversations = load_conversations()
     except DatasetError as error:
-        print(f"Data warning: {error}")
-        print("The chatbot will continue with basic rule-based responses only.")
+        print(f"Data warning: {error}", file=sys.stderr)
+        print(
+            "The chatbot will continue with basic rule-based responses only.",
+            file=sys.stderr,
+        )
         conversations = {}
+
+    if args.message is not None:
+        print(respond(args.message, conversations))
+        return
 
     print("Rule-based chatbot ready. Type 'quit' to exit.")
     while True:
@@ -151,8 +181,9 @@ def main() -> None:
             print("\nGoodbye.")
             break
 
-        print(f"Bot: {respond(message, conversations)}")
-        if is_exit_command(message):
+        normalized = normalize_live_input(message)
+        print(f"Bot: {_respond_normalized(normalized, conversations)}")
+        if normalized in EXIT_COMMANDS:
             break
 
 
