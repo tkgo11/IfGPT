@@ -46,6 +46,12 @@ To answer a single message and exit, pass it as an argument.
 python3 chatbot.py "hello"
 ```
 
+If the message itself starts with `-`, separate it with `--` (standard argument parsing).
+
+```bash
+python3 chatbot.py -- "-weird prompt"
+```
+
 ## Validate and Test
 
 Validate the corpus without changing it.
@@ -68,7 +74,7 @@ python3 -m unittest -v test_chatbot.py test_validate_dataset.py
 
 The validator checks that the corpus has exactly the expected number of records (2,400 by default), all IDs are unique and cover the expected range, every prompt is unique, each record has the required schema, and every stored prompt complies with the comparison-form standard.
 
-Lint and type checks run the same way locally and in CI (`.github/workflows/ci.yml`); install the tools with `pip install ruff mypy` first.
+Lint and type checks run the same way locally and in CI (`.github/workflows/ci.yml`); install the pinned tools with `pip install "ruff==0.16.7" "mypy==2.3.1"` first.
 
 ```bash
 ruff check . && ruff format --check .

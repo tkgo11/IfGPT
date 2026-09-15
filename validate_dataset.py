@@ -6,14 +6,34 @@ from __future__ import annotations
 import argparse
 import itertools
 import json
+import os
 import re
+import sys
 import unicodedata
 from pathlib import Path
 
 DEFAULT_DATA_FILE = Path(__file__).with_name("conversations.jsonl")
 PUNCTUATION_RE = re.compile(r"[^\w\s]", flags=re.UNICODE)
-MULTI_WHITESPACE_RE = re.compile(r"\s{2,}")
+NON_SPACE_WHITESPACE_RE = re.compile(r"[^\S ]")
+MULTI_SPACE_RE = re.compile(r" {2,}")
 REQUIRED_FIELDS = {"id", "category", "user_message", "assistant_response"}
+
+# Prompts that a built-in rule handles before corpus lookup are
+# unreachable data; flag them. Skipped when chatbot.py is absent.
+_RESERVED_PROMPTS: frozenset[str] = frozenset()
+try:
+    import chatbot as _chatbot
+except ImportError:
+    pass
+else:
+    _RESERVED_PROMPTS = frozenset(
+        _chatbot.GREETINGS
+        | _chatbot.FAREWELLS
+        | _chatbot.THANKS
+        | _chatbot.EXIT_COMMANDS
+        | _chatbot.HELP_REQUESTS
+        | _chatbot.IDENTITY_QUESTIONS
+    )
 
 
 def comparison_form_error(text: str) -> str | None:
@@ -26,13 +46,22 @@ def comparison_form_error(text: str) -> str | None:
         return "has leading or trailing whitespace"
     if PUNCTUATION_RE.search(text):
         return "contains punctuation"
-    if MULTI_WHITESPACE_RE.search(text):
+    if NON_SPACE_WHITESPACE_RE.search(text):
+        return "contains non-space whitespace"
+    if MULTI_SPACE_RE.search(text):
         return "contains repeated whitespace"
     return None
 
 
 def validate(data_file: Path, expected_count: int = 2400) -> list[str]:
     """Return every schema, uniqueness, ID, and comparison-form error found."""
+    if (
+        not isinstance(expected_count, int)
+        or isinstance(expected_count, bool)
+        or expected_count < 1
+    ):
+        raise ValueError("expected_count must be a positive integer")
+
     errors: list[str] = []
     seen_ids: dict[int, int] = {}
     seen_messages: dict[str, int] = {}
@@ -54,6 +83,12 @@ def validate(data_file: Path, expected_count: int = 2400) -> list[str]:
                     record = json.loads(line)
                 except json.JSONDecodeError as error:
                     errors.append(f"line {line_number}: invalid JSON ({error.msg})")
+                    continue
+                except (RecursionError, ValueError) as error:
+                    # Pathological JSON that is not a JSONDecodeError:
+                    # nesting past the recursion limit or integer tokens
+                    # beyond the digit cap.
+                    errors.append(f"line {line_number}: invalid JSON ({error})")
                     continue
 
                 record_count += 1
@@ -97,6 +132,11 @@ def validate(data_file: Path, expected_count: int = 2400) -> list[str]:
                     form_error = comparison_form_error(message)
                     if form_error:
                         errors.append(f"line {line_number}: user_message {form_error}")
+                    if message in _RESERVED_PROMPTS:
+                        errors.append(
+                            f"line {line_number}: user_message {message!r} is "
+                            "shadowed by a built-in rule"
+                        )
                     if message in seen_messages:
                         errors.append(
                             f"line {line_number}: duplicate user_message "
@@ -110,8 +150,20 @@ def validate(data_file: Path, expected_count: int = 2400) -> list[str]:
                         f"line {line_number}: assistant_response must be a "
                         "non-empty string"
                     )
+                else:
+                    try:
+                        response.encode("utf-8")
+                    except UnicodeEncodeError:
+                        errors.append(
+                            f"line {line_number}: assistant_response is not "
+                            "UTF-8 encodable"
+                        )
     except UnicodeDecodeError as error:
         errors.append(f"'{data_file}' is not valid UTF-8: {error}")
+    except OSError as error:
+        errors.append(f"Error reading '{data_file}': {error}")
+    except MemoryError:
+        errors.append(f"'{data_file}' is too large to read")
 
     if record_count != expected_count:
         errors.append(f"record count is {record_count}; expected {expected_count}")
@@ -169,11 +221,22 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     print(
-        f"VALIDATION PASSED: {args.expected_count} records, unique ids and "
+        f"VALIDATION PASSED: {args.expected_count} "
+        f"record{'s' if args.expected_count != 1 else ''}, unique ids and "
         "prompts, valid schema, valid comparison form."
     )
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        exit_code = main()
+        # stdout is block-buffered on pipes; flush now so a downstream-
+        # closed pipe raises here, inside the handler's reach.
+        sys.stdout.flush()
+    except BrokenPipeError:
+        # stdout was closed early (e.g. piped into `head`). Redirect the
+        # file descriptor so interpreter shutdown does not re-raise.
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        raise SystemExit(0) from None
+    raise SystemExit(exit_code)

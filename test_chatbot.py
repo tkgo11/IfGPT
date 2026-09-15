@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -21,15 +22,15 @@ CHATBOT = Path(__file__).resolve().with_name("chatbot.py")
 def run_cli(
     *args: str,
     stdin: str = "",
-    cwd: Path | None = None,
     script: Path = CHATBOT,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, str(script), *args],
         input=stdin,
         capture_output=True,
         text=True,
-        cwd=cwd,
+        env=env,
         timeout=30,
     )
 
@@ -132,6 +133,38 @@ class LoadConversationsTests(unittest.TestCase):
             with self.assertRaises(chatbot.DatasetError):
                 chatbot.load_conversations(data_file)
 
+    def test_deeply_nested_json_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data_file = Path(directory) / "data.jsonl"
+            data_file.write_text("[" * 2000 + "]" * 2000 + "\n", encoding="utf-8")
+            with self.assertRaises(chatbot.DatasetError):
+                chatbot.load_conversations(data_file)
+
+    def test_oversized_int_token_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data_file = Path(directory) / "data.jsonl"
+            data_file.write_text("9" * 5000 + "\n", encoding="utf-8")
+            with self.assertRaises(chatbot.DatasetError):
+                chatbot.load_conversations(data_file)
+
+    def test_empty_file_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data_file = Path(directory) / "data.jsonl"
+            data_file.write_text("", encoding="utf-8")
+            with self.assertRaises(chatbot.DatasetError):
+                chatbot.load_conversations(data_file)
+
+    def test_surrogate_response_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data_file = Path(directory) / "data.jsonl"
+            data_file.write_text(
+                '{"id":1,"category":"t","user_message":"hi",'
+                '"assistant_response":"\\ud800 x"}\n',
+                encoding="utf-8",
+            )
+            with self.assertRaises(chatbot.DatasetError):
+                chatbot.load_conversations(data_file)
+
 
 class RespondTests(unittest.TestCase):
     conversations: ClassVar[dict[str, str]]
@@ -231,12 +264,13 @@ class CliTests(unittest.TestCase):
         self.assertEqual(result.stderr, "")
 
     def test_oneshot_corpus_hit(self) -> None:
-        result = run_cli(
+        prompt = (
             "how can i decide whether to ask for more time before agreeing to something"
         )
+        expected = chatbot.respond(prompt, chatbot.load_conversations())
+        result = run_cli(prompt)
         self.assertEqual(result.returncode, 0)
-        self.assertTrue(result.stdout.endswith("\n"))
-        self.assertGreater(len(result.stdout.strip()), 50)
+        self.assertEqual(result.stdout, expected + "\n")
         self.assertNotIn("You:", result.stdout)
 
     def test_oneshot_exit_command(self) -> None:
@@ -274,6 +308,52 @@ class CliTests(unittest.TestCase):
         self.assertIn("Data warning:", result.stderr)
         self.assertNotIn("Data warning:", result.stdout)
         self.assertIn("Bot: Goodbye.", result.stdout)
+
+    def test_empty_corpus_warns_on_stderr(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / "chatbot.py"
+            script.write_text(CHATBOT.read_text(encoding="utf-8"), encoding="utf-8")
+            (Path(directory) / "conversations.jsonl").write_text("", encoding="utf-8")
+            result = run_cli(stdin="quit\n", script=script)
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("no records", result.stderr)
+        self.assertIn("Bot: Goodbye.", result.stdout)
+
+    def test_closed_stdin_exits_cleanly(self) -> None:
+        result = subprocess.run(
+            ["bash", "-c", f"exec 0<&-; {sys.executable} {CHATBOT}"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("Goodbye.", result.stdout)
+
+    def test_strict_stdin_invalid_utf8_exits_cleanly(self) -> None:
+        env = {**os.environ, "PYTHONIOENCODING": "utf-8:strict"}
+        result = subprocess.run(
+            [sys.executable, str(CHATBOT)],
+            input=b"hi\n\xff\xfe\nquit\n",
+            capture_output=True,
+            env=env,
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertIn(b"Goodbye.", result.stdout)
+
+    def test_broken_pipe_exits_cleanly(self) -> None:
+        proc = subprocess.Popen(
+            [sys.executable, str(CHATBOT), "hello"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert proc.stdout is not None
+        proc.stdout.close()
+        stderr = proc.stderr.read() if proc.stderr else b""
+        proc.wait(timeout=30)
+        self.assertEqual(proc.returncode, 0)
+        self.assertNotIn(b"Broken pipe", stderr)
+        self.assertNotIn(b"Exception", stderr)
 
 
 if __name__ == "__main__":
