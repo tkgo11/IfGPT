@@ -223,10 +223,18 @@ if __name__ == "__main__":
     try:
         main()
         # stdout is block-buffered on pipes; flush now so a downstream-
-        # closed pipe raises here, inside the handler's reach.
-        sys.stdout.flush()
+        # closed pipe raises here, inside the handler's reach. stdout is
+        # None when fd 1 was closed at exec; print() no-ops but flush()
+        # would raise AttributeError.
+        if sys.stdout is not None:
+            sys.stdout.flush()
     except BrokenPipeError:
         # stdout was closed early (e.g. piped into `head`). Redirect the
         # file descriptor so interpreter shutdown does not re-raise.
-        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        try:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, sys.stdout.fileno())
+            os.close(devnull)
+        except (AttributeError, OSError):
+            pass
         raise SystemExit(0) from None

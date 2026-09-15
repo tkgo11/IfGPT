@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import itertools
 import json
 import os
@@ -17,23 +18,30 @@ PUNCTUATION_RE = re.compile(r"[^\w\s]", flags=re.UNICODE)
 NON_SPACE_WHITESPACE_RE = re.compile(r"[^\S ]")
 MULTI_SPACE_RE = re.compile(r" {2,}")
 REQUIRED_FIELDS = {"id", "category", "user_message", "assistant_response"}
+DEFAULT_EXPECTED_COUNT = 2400
 
 # Prompts that a built-in rule handles before corpus lookup are
-# unreachable data; flag them. Skipped when chatbot.py is absent.
+# unreachable data; flag them. Load the sibling chatbot.py by explicit
+# path so a foreign `chatbot` module on sys.path cannot shadow it, and
+# skip the check entirely when the sibling is absent or unimportable.
 _RESERVED_PROMPTS: frozenset[str] = frozenset()
-try:
-    import chatbot as _chatbot
-except ImportError:
-    pass
-else:
-    _RESERVED_PROMPTS = frozenset(
-        _chatbot.GREETINGS
-        | _chatbot.FAREWELLS
-        | _chatbot.THANKS
-        | _chatbot.EXIT_COMMANDS
-        | _chatbot.HELP_REQUESTS
-        | _chatbot.IDENTITY_QUESTIONS
-    )
+_CHATBOT_PATH = Path(__file__).with_name("chatbot.py")
+if _CHATBOT_PATH.is_file():
+    try:
+        _spec = importlib.util.spec_from_file_location("chatbot", _CHATBOT_PATH)
+        if _spec is not None and _spec.loader is not None:
+            _chatbot = importlib.util.module_from_spec(_spec)
+            _spec.loader.exec_module(_chatbot)
+            _RESERVED_PROMPTS = frozenset(
+                _chatbot.GREETINGS
+                | _chatbot.FAREWELLS
+                | _chatbot.THANKS
+                | _chatbot.EXIT_COMMANDS
+                | _chatbot.HELP_REQUESTS
+                | _chatbot.IDENTITY_QUESTIONS
+            )
+    except Exception:
+        pass
 
 
 def comparison_form_error(text: str) -> str | None:
@@ -53,7 +61,9 @@ def comparison_form_error(text: str) -> str | None:
     return None
 
 
-def validate(data_file: Path, expected_count: int = 2400) -> list[str]:
+def validate(
+    data_file: Path, expected_count: int = DEFAULT_EXPECTED_COUNT
+) -> list[str]:
     """Return every schema, uniqueness, ID, and comparison-form error found."""
     if (
         not isinstance(expected_count, int)
@@ -129,6 +139,12 @@ def validate(data_file: Path, expected_count: int = 2400) -> list[str]:
                         f"line {line_number}: user_message must be a non-empty string"
                     )
                 else:
+                    try:
+                        message.encode("utf-8")
+                    except UnicodeEncodeError:
+                        errors.append(
+                            f"line {line_number}: user_message is not UTF-8 encodable"
+                        )
                     form_error = comparison_form_error(message)
                     if form_error:
                         errors.append(f"line {line_number}: user_message {form_error}")
@@ -201,7 +217,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--expected-count",
         type=int,
-        default=2400,
+        default=DEFAULT_EXPECTED_COUNT,
         metavar="N",
         help="expected record count and id range 1..N (default: %(default)s)",
     )
@@ -232,11 +248,19 @@ if __name__ == "__main__":
     try:
         exit_code = main()
         # stdout is block-buffered on pipes; flush now so a downstream-
-        # closed pipe raises here, inside the handler's reach.
-        sys.stdout.flush()
+        # closed pipe raises here, inside the handler's reach. stdout is
+        # None when fd 1 was closed at exec; print() no-ops but flush()
+        # would raise AttributeError.
+        if sys.stdout is not None:
+            sys.stdout.flush()
     except BrokenPipeError:
         # stdout was closed early (e.g. piped into `head`). Redirect the
         # file descriptor so interpreter shutdown does not re-raise.
-        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        try:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, sys.stdout.fileno())
+            os.close(devnull)
+        except (AttributeError, OSError):
+            pass
         raise SystemExit(0) from None
     raise SystemExit(exit_code)
