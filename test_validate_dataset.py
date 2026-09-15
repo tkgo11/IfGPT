@@ -7,6 +7,7 @@ import json
 import subprocess
 import sys
 import tempfile
+import threading
 import unicodedata
 import unittest
 from pathlib import Path
@@ -24,15 +25,16 @@ class ComparisonFormTests(unittest.TestCase):
 
     def test_each_violation_detected(self) -> None:
         cases = {
-            "not nfc": unicodedata.normalize("NFD", "café"),
-            "uppercase": "Has Capitals",
-            "edge whitespace": " padded ",
-            "punctuation": "has punct!",
-            "repeated whitespace": "double  space",
+            "not nfc": (unicodedata.normalize("NFD", "café"), "NFC"),
+            "uppercase": ("Has Capitals", "lowercase"),
+            "edge whitespace": (" padded ", "leading or trailing"),
+            "punctuation": ("has punct!", "punctuation"),
+            "tab whitespace": ("a\tb", "non-space whitespace"),
+            "repeated whitespace": ("double  space", "repeated whitespace"),
         }
-        for name, text in cases.items():
+        for name, (text, expected) in cases.items():
             with self.subTest(name=name):
-                self.assertIsNotNone(vd.comparison_form_error(text))
+                self.assertIn(expected, vd.comparison_form_error(text) or "")
 
     def test_agrees_with_chatbot_normalize_on_corpus(self) -> None:
         # comparison_form_error(m) is None iff normalize(m) == m; both must
@@ -133,9 +135,24 @@ class ValidateTests(unittest.TestCase):
 
     def test_huge_expected_count_does_not_hang(self) -> None:
         # The id-range check must not materialize set(range(1, N + 1)).
-        errors = self.validate_records([record(1)], expected_count=10**9)
+        result: list[list[str]] = []
+        worker = threading.Thread(
+            target=lambda: result.append(
+                self.validate_records([record(1)], expected_count=10**9)
+            ),
+            daemon=True,
+        )
+        worker.start()
+        worker.join(timeout=10)
+        self.assertFalse(worker.is_alive(), "validate() hung on huge count")
+        errors = result[0]
         self.assertTrue(any("record count is 1" in e for e in errors))
         self.assertTrue(any("missing ids" in e for e in errors))
+
+    def test_expected_count_param_validated(self) -> None:
+        for bad in (0, -3, 2.5, "5", True):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                self.validate_records([record(1)], expected_count=bad)  # type: ignore[arg-type]
 
     def test_unopenable_file(self) -> None:
         errors = vd.validate(Path("/nonexistent/missing.jsonl"))
@@ -148,6 +165,37 @@ class ValidateTests(unittest.TestCase):
             data_file.write_bytes(b'{"id":1}\n\xff\xfe\n')
             errors = vd.validate(data_file, expected_count=1)
         self.assertTrue(any("not valid UTF-8" in e for e in errors))
+
+    def test_deeply_nested_json_reported_not_crash(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data_file = Path(directory) / "data.jsonl"
+            data_file.write_text("[" * 2000 + "]" * 2000 + "\n", encoding="utf-8")
+            errors = vd.validate(data_file, expected_count=1)
+        self.assertTrue(any("invalid JSON" in e for e in errors))
+
+    def test_oversized_int_token_reported_not_crash(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data_file = Path(directory) / "data.jsonl"
+            data_file.write_text("9" * 5000 + "\n", encoding="utf-8")
+            errors = vd.validate(data_file, expected_count=1)
+        self.assertTrue(any("invalid JSON" in e for e in errors))
+
+    def test_rule_shadowed_prompt_flagged(self) -> None:
+        errors = self.validate_records(
+            [record(1, user_message="hello")], expected_count=1
+        )
+        self.assertTrue(any("shadowed by a built-in rule" in e for e in errors))
+
+    def test_surrogate_response_flagged(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data_file = Path(directory) / "data.jsonl"
+            data_file.write_text(
+                '{"id":1,"category":"t","user_message":"hi",'
+                '"assistant_response":"\\ud800 x"}\n',
+                encoding="utf-8",
+            )
+            errors = vd.validate(data_file, expected_count=1)
+        self.assertTrue(any("not UTF-8 encodable" in e for e in errors))
 
 
 class CliTests(unittest.TestCase):
@@ -187,7 +235,7 @@ class CliTests(unittest.TestCase):
             data_file.write_text(json.dumps(record(1)) + "\n", encoding="utf-8")
             result = self.run_cli(str(data_file), "--expected-count", "1")
         self.assertEqual(result.returncode, 0)
-        self.assertIn("VALIDATION PASSED: 1 records", result.stdout)
+        self.assertIn("VALIDATION PASSED: 1 record,", result.stdout)
 
 
 if __name__ == "__main__":

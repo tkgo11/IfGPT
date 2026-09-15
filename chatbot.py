@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 import unicodedata
@@ -73,6 +74,13 @@ def load_conversations(data_file: Path | str = DATA_FILE) -> dict[str, str]:
                     raise DatasetError(
                         f"Invalid JSON at line {line_number}: {error.msg}"
                     ) from error
+                except (RecursionError, ValueError) as error:
+                    # json.loads can also fail on pathological input that
+                    # is not a JSONDecodeError: nesting past the recursion
+                    # limit or integer tokens beyond the digit cap.
+                    raise DatasetError(
+                        f"Invalid JSON at line {line_number}: {error}"
+                    ) from error
 
                 if not isinstance(record, dict) or not REQUIRED_FIELDS.issubset(record):
                     raise DatasetError(f"Invalid record schema at line {line_number}.")
@@ -87,6 +95,12 @@ def load_conversations(data_file: Path | str = DATA_FILE) -> dict[str, str]:
                         f"Duplicate user_message at line {line_number}: "
                         f"{record['user_message']!r}"
                     )
+                try:
+                    record["assistant_response"].encode("utf-8")
+                except UnicodeEncodeError as error:
+                    raise DatasetError(
+                        f"Unencodable response text at line {line_number}."
+                    ) from error
 
                 # Important: do not normalize, alter, or rewrite stored data here.
                 conversations[record["user_message"]] = record["assistant_response"]
@@ -94,6 +108,13 @@ def load_conversations(data_file: Path | str = DATA_FILE) -> dict[str, str]:
             raise DatasetError(
                 f"Data file '{path}' is not valid UTF-8: {error}"
             ) from error
+        except OSError as error:
+            raise DatasetError(f"Error reading data file '{path}': {error}") from error
+        except MemoryError as error:
+            raise DatasetError(f"Data file '{path}' is too large to read.") from error
+
+    if not conversations:
+        raise DatasetError(f"Data file '{path}' contains no records.")
 
     return conversations
 
@@ -151,7 +172,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "message",
         nargs="?",
-        help="single message to answer; omit to start an interactive session",
+        help="single message to answer (prefix with '--' if it starts "
+        "with '-'); omit to start an interactive session",
     )
     return parser.parse_args(argv)
 
@@ -159,6 +181,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> None:
     """Run the chatbot: one-shot when a message is given, else interactive."""
     args = _parse_args(argv)
+    for stream in (sys.stdout, sys.stderr):
+        # Replace unencodable output instead of crashing on narrow locales.
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="replace")
     try:
         conversations = load_conversations()
     except DatasetError as error:
@@ -177,15 +203,30 @@ def main(argv: list[str] | None = None) -> None:
     while True:
         try:
             message = input("You: ")
+            normalized = normalize_live_input(message)
         except (EOFError, KeyboardInterrupt):
             print("\nGoodbye.")
             break
+        except (OSError, RuntimeError, ValueError, MemoryError) as error:
+            # Closed/lost stdin, undecodable input, or out of memory while
+            # reading a line all end the session rather than crash.
+            print(f"\nInput error: {error}", file=sys.stderr)
+            print("Goodbye.")
+            break
 
-        normalized = normalize_live_input(message)
         print(f"Bot: {_respond_normalized(normalized, conversations)}")
         if normalized in EXIT_COMMANDS:
             break
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+        # stdout is block-buffered on pipes; flush now so a downstream-
+        # closed pipe raises here, inside the handler's reach.
+        sys.stdout.flush()
+    except BrokenPipeError:
+        # stdout was closed early (e.g. piped into `head`). Redirect the
+        # file descriptor so interpreter shutdown does not re-raise.
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        raise SystemExit(0) from None

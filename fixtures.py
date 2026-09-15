@@ -20,10 +20,8 @@ def record(
     }
 
 
-def write_jsonl(
-    directory: Path, records: list[object], name: str = "data.jsonl"
-) -> Path:
-    data_file = directory / name
+def write_jsonl(directory: Path, records: list[object]) -> Path:
+    data_file = directory / "data.jsonl"
     data_file.write_text(
         "".join(json.dumps(r) + "\n" for r in records), encoding="utf-8"
     )
