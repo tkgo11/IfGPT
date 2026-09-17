@@ -3,7 +3,12 @@
 
 from __future__ import annotations
 
+import argparse
+import contextlib
+import importlib.util
+import itertools
 import json
+import os
 import re
 import sys
 import unicodedata
@@ -11,8 +16,33 @@ from pathlib import Path
 
 DEFAULT_DATA_FILE = Path(__file__).with_name("conversations.jsonl")
 PUNCTUATION_RE = re.compile(r"[^\w\s]", flags=re.UNICODE)
-MULTI_WHITESPACE_RE = re.compile(r"\s{2,}")
+NON_SPACE_WHITESPACE_RE = re.compile(r"[^\S ]")
+MULTI_SPACE_RE = re.compile(r" {2,}")
 REQUIRED_FIELDS = {"id", "category", "user_message", "assistant_response"}
+DEFAULT_EXPECTED_COUNT = 2400
+
+# Prompts that a built-in rule handles before corpus lookup are
+# unreachable data; flag them. Load the sibling chatbot.py by explicit
+# path so a foreign `chatbot` module on sys.path cannot shadow it, and
+# skip the check entirely when the sibling is absent or unimportable.
+_RESERVED_PROMPTS: frozenset[str] = frozenset()
+_CHATBOT_PATH = Path(__file__).with_name("chatbot.py")
+if _CHATBOT_PATH.is_file():
+    try:
+        _spec = importlib.util.spec_from_file_location("chatbot", _CHATBOT_PATH)
+        if _spec is not None and _spec.loader is not None:
+            _chatbot = importlib.util.module_from_spec(_spec)
+            _spec.loader.exec_module(_chatbot)
+            _RESERVED_PROMPTS = frozenset(
+                _chatbot.GREETINGS
+                | _chatbot.FAREWELLS
+                | _chatbot.THANKS
+                | _chatbot.EXIT_COMMANDS
+                | _chatbot.HELP_REQUESTS
+                | _chatbot.IDENTITY_QUESTIONS
+            )
+    except (Exception, SystemExit):
+        pass  # best-effort diagnostic; a broken sibling must not kill us
 
 
 def comparison_form_error(text: str) -> str | None:
@@ -25,13 +55,25 @@ def comparison_form_error(text: str) -> str | None:
         return "has leading or trailing whitespace"
     if PUNCTUATION_RE.search(text):
         return "contains punctuation"
-    if MULTI_WHITESPACE_RE.search(text):
+    if NON_SPACE_WHITESPACE_RE.search(text):
+        return "contains non-space whitespace"
+    if MULTI_SPACE_RE.search(text):
         return "contains repeated whitespace"
     return None
 
 
-def validate(data_file: Path, expected_count: int = 2400) -> list[str]:
+def validate(
+    data_file: Path | str, expected_count: int = DEFAULT_EXPECTED_COUNT
+) -> list[str]:
     """Return every schema, uniqueness, ID, and comparison-form error found."""
+    data_file = Path(data_file)
+    if (
+        not isinstance(expected_count, int)
+        or isinstance(expected_count, bool)
+        or expected_count < 1
+    ):
+        raise ValueError("expected_count must be a positive integer")
+
     errors: list[str] = []
     seen_ids: dict[int, int] = {}
     seen_messages: dict[str, int] = {}
@@ -39,89 +81,200 @@ def validate(data_file: Path, expected_count: int = 2400) -> list[str]:
 
     try:
         source = data_file.open("r", encoding="utf-8")
-    except OSError as error:
+    except (OSError, ValueError) as error:
+        # OSError: missing/unreadable file; ValueError: e.g. embedded NUL.
         return [f"Could not open '{data_file}': {error}"]
 
-    with source:
-        for line_number, line in enumerate(source, start=1):
-            if not line.strip():
-                errors.append(f"line {line_number}: blank JSONL record")
-                continue
+    try:
+        with source:
+            for line_number, line in enumerate(source, start=1):
+                if not line.strip():
+                    errors.append(f"line {line_number}: blank JSONL record")
+                    continue
 
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError as error:
-                errors.append(f"line {line_number}: invalid JSON ({error.msg})")
-                continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError as error:
+                    errors.append(f"line {line_number}: invalid JSON ({error.msg})")
+                    continue
+                except (RecursionError, ValueError) as error:
+                    # Pathological JSON that is not a JSONDecodeError:
+                    # nesting past the recursion limit or integer tokens
+                    # beyond the digit cap.
+                    errors.append(f"line {line_number}: invalid JSON ({error})")
+                    continue
 
-            record_count += 1
-            if not isinstance(record, dict):
-                errors.append(f"line {line_number}: record is not an object")
-                continue
-            if set(record) != REQUIRED_FIELDS:
-                errors.append(
-                    f"line {line_number}: fields must be exactly {sorted(REQUIRED_FIELDS)}"
-                )
-                continue
-
-            record_id = record["id"]
-            category = record["category"]
-            message = record["user_message"]
-            response = record["assistant_response"]
-            if not isinstance(record_id, int) or isinstance(record_id, bool) or record_id < 1:
-                errors.append(f"line {line_number}: id must be a positive integer")
-            elif record_id in seen_ids:
-                errors.append(
-                    f"line {line_number}: duplicate id {record_id} "
-                    f"(first seen at line {seen_ids[record_id]})"
-                )
-            else:
-                seen_ids[record_id] = line_number
-
-            if not isinstance(category, str) or not category.strip():
-                errors.append(f"line {line_number}: category must be a non-empty string")
-            if not isinstance(message, str) or not message:
-                errors.append(f"line {line_number}: user_message must be a non-empty string")
-            else:
-                form_error = comparison_form_error(message)
-                if form_error:
-                    errors.append(f"line {line_number}: user_message {form_error}")
-                if message in seen_messages:
+                record_count += 1
+                if not isinstance(record, dict):
+                    errors.append(f"line {line_number}: record is not an object")
+                    continue
+                if set(record) != REQUIRED_FIELDS:
                     errors.append(
-                        f"line {line_number}: duplicate user_message {message!r} "
-                        f"(first seen at line {seen_messages[message]})"
+                        f"line {line_number}: fields must be exactly "
+                        f"{sorted(REQUIRED_FIELDS)}"
+                    )
+                    continue
+
+                record_id = record["id"]
+                category = record["category"]
+                message = record["user_message"]
+                response = record["assistant_response"]
+                if (
+                    not isinstance(record_id, int)
+                    or isinstance(record_id, bool)
+                    or record_id < 1
+                ):
+                    errors.append(f"line {line_number}: id must be a positive integer")
+                elif record_id in seen_ids:
+                    errors.append(
+                        f"line {line_number}: duplicate id {record_id} "
+                        f"(first seen at line {seen_ids[record_id]})"
                     )
                 else:
-                    seen_messages[message] = line_number
-            if not isinstance(response, str) or not response.strip():
-                errors.append(f"line {line_number}: assistant_response must be a non-empty string")
+                    seen_ids[record_id] = line_number
+
+                if not isinstance(category, str) or not category.strip():
+                    errors.append(
+                        f"line {line_number}: category must be a non-empty string"
+                    )
+                if not isinstance(message, str) or not message:
+                    errors.append(
+                        f"line {line_number}: user_message must be a non-empty string"
+                    )
+                else:
+                    try:
+                        message.encode("utf-8")
+                    except UnicodeEncodeError:
+                        errors.append(
+                            f"line {line_number}: user_message is not UTF-8 encodable"
+                        )
+                    form_error = comparison_form_error(message)
+                    if form_error:
+                        errors.append(f"line {line_number}: user_message {form_error}")
+                    if message in _RESERVED_PROMPTS:
+                        errors.append(
+                            f"line {line_number}: user_message {message!r} is "
+                            "shadowed by a built-in rule"
+                        )
+                    if message in seen_messages:
+                        errors.append(
+                            f"line {line_number}: duplicate user_message "
+                            f"{message!r} (first seen at line "
+                            f"{seen_messages[message]})"
+                        )
+                    else:
+                        seen_messages[message] = line_number
+                if not isinstance(response, str) or not response.strip():
+                    errors.append(
+                        f"line {line_number}: assistant_response must be a "
+                        "non-empty string"
+                    )
+                else:
+                    try:
+                        response.encode("utf-8")
+                    except UnicodeEncodeError:
+                        errors.append(
+                            f"line {line_number}: assistant_response is not "
+                            "UTF-8 encodable"
+                        )
+    except UnicodeDecodeError as error:
+        errors.append(f"'{data_file}' is not valid UTF-8: {error}")
+    except OSError as error:
+        errors.append(f"Error reading '{data_file}': {error}")
+    except MemoryError:
+        errors.append(f"'{data_file}' is too large to read")
 
     if record_count != expected_count:
         errors.append(f"record count is {record_count}; expected {expected_count}")
-    if len(seen_ids) == expected_count:
-        expected_ids = set(range(1, expected_count + 1))
-        missing_ids = sorted(expected_ids - set(seen_ids))
-        extra_ids = sorted(set(seen_ids) - expected_ids)
+    if seen_ids:
+        # Lazy range checks: never materialize or iterate range(1, N + 1)
+        # when --expected-count is large. islice stops after the first 10
+        # ascending missing ids; extras iterate the small seen set.
+        missing_ids = list(
+            itertools.islice(
+                (i for i in range(1, expected_count + 1) if i not in seen_ids),
+                10,
+            )
+        )
+        extra_ids = sorted(i for i in seen_ids if not 1 <= i <= expected_count)[:10]
         if missing_ids:
-            errors.append(f"missing ids: {missing_ids[:10]}")
+            errors.append(f"missing ids: {missing_ids}")
         if extra_ids:
-            errors.append(f"ids outside expected range: {extra_ids[:10]}")
+            errors.append(f"ids outside expected range: {extra_ids}")
 
     return errors
 
 
-def main() -> int:
-    data_file = Path(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_DATA_FILE
-    errors = validate(data_file)
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Validate the authored JSONL conversation corpus "
+        "without modifying it."
+    )
+    parser.add_argument(
+        "data_file",
+        nargs="?",
+        type=Path,
+        default=DEFAULT_DATA_FILE,
+        help="JSONL corpus path (default: conversations.jsonl next to this script)",
+    )
+    parser.add_argument(
+        "--expected-count",
+        type=int,
+        default=DEFAULT_EXPECTED_COUNT,
+        metavar="N",
+        help="expected record count and id range 1..N (default: %(default)s)",
+    )
+    args = parser.parse_args(argv)
+    if args.expected_count < 1:
+        parser.error("--expected-count must be a positive integer")
+    return args
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(argv)
+    for stream in (sys.stdout, sys.stderr):
+        # Replace unencodable output instead of crashing on narrow locales
+        # or surrogate-escaped filenames in error text. Suppressed when the
+        # stream is None, closed, or lacks reconfigure.
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            with contextlib.suppress(ValueError, OSError):
+                reconfigure(errors="replace")
+    errors = validate(args.data_file, expected_count=args.expected_count)
     if errors:
         print(f"VALIDATION FAILED: {len(errors)} issue(s)")
         for error in errors:
             print(f"- {error}")
         return 1
 
-    print("VALIDATION PASSED: 2400 records, unique ids and prompts, valid schema, valid comparison form.")
+    print(
+        f"VALIDATION PASSED: {args.expected_count} "
+        f"record{'s' if args.expected_count != 1 else ''}, unique ids and "
+        "prompts, valid schema, valid comparison form."
+    )
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        exit_code = main()
+        # stdout is block-buffered on pipes; flush now so a downstream
+        # write failure raises here, inside the handler's reach. stdout
+        # is None when fd 1 was closed at exec; print() no-ops but
+        # flush() would raise AttributeError.
+        if sys.stdout is not None:
+            sys.stdout.flush()
+    except OSError:
+        # Output fd is dead: closed early (dead pipe, `| head`), full
+        # device, or reset socket. Redirect both fds so interpreter
+        # shutdown does not re-raise. Exit non-zero: a validator must
+        # not mask a lost report (and any real verdict) as success.
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                devnull = os.open(os.devnull, os.O_WRONLY)
+                os.dup2(devnull, stream.fileno())
+                os.close(devnull)
+            except (AttributeError, OSError):
+                pass
+        raise SystemExit(1) from None
+    raise SystemExit(exit_code)

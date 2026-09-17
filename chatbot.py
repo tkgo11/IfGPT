@@ -7,18 +7,23 @@ and compared exactly as they appear in ``conversations.jsonl``.
 
 from __future__ import annotations
 
+import argparse
+import contextlib
 import json
+import os
 import re
+import sys
 import unicodedata
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Mapping
 
 DATA_FILE = Path(__file__).with_name("conversations.jsonl")
 PUNCTUATION_RE = re.compile(r"[^\w\s]", flags=re.UNICODE)
 WHITESPACE_RE = re.compile(r"\s+")
+REQUIRED_FIELDS = {"id", "category", "user_message", "assistant_response"}
 
 GREETINGS = {"hello", "hi", "hey", "good morning", "good afternoon", "good evening"}
-FAREWELLS = {"goodbye", "bye", "see you", "see you later", "farewell"}
+FAREWELLS = {"see you", "see you later", "farewell"}
 THANKS = {"thanks", "thank you", "thanks a lot", "thank you very much"}
 EXIT_COMMANDS = {"quit", "exit", "bye", "goodbye", "stop"}
 HELP_REQUESTS = {
@@ -56,35 +61,62 @@ def load_conversations(data_file: Path | str = DATA_FILE) -> dict[str, str]:
 
     try:
         source = path.open("r", encoding="utf-8")
-    except OSError as error:
+    except (OSError, ValueError) as error:
+        # OSError: missing/unreadable file; ValueError: e.g. embedded NUL.
         raise DatasetError(f"Could not open data file '{path}': {error}") from error
 
     with source:
-        for line_number, line in enumerate(source, start=1):
-            if not line.strip():
-                raise DatasetError(f"Blank record at line {line_number}.")
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError as error:
-                raise DatasetError(
-                    f"Invalid JSON at line {line_number}: {error.msg}"
-                ) from error
+        try:
+            for line_number, line in enumerate(source, start=1):
+                if not line.strip():
+                    raise DatasetError(f"Blank record at line {line_number}.")
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError as error:
+                    raise DatasetError(
+                        f"Invalid JSON at line {line_number}: {error.msg}"
+                    ) from error
+                except (RecursionError, ValueError) as error:
+                    # json.loads can also fail on pathological input that
+                    # is not a JSONDecodeError: nesting past the recursion
+                    # limit or integer tokens beyond the digit cap.
+                    raise DatasetError(
+                        f"Invalid JSON at line {line_number}: {error}"
+                    ) from error
 
-            required_fields = {"id", "category", "user_message", "assistant_response"}
-            if not isinstance(record, dict) or not required_fields.issubset(record):
-                raise DatasetError(f"Invalid record schema at line {line_number}.")
-            if not isinstance(record["user_message"], str) or not isinstance(
-                record["assistant_response"], str
-            ):
-                raise DatasetError(f"Non-string conversation text at line {line_number}.")
-            if record["user_message"] in conversations:
-                raise DatasetError(
-                    f"Duplicate user_message at line {line_number}: "
-                    f"{record['user_message']!r}"
-                )
+                if not isinstance(record, dict) or not REQUIRED_FIELDS.issubset(record):
+                    raise DatasetError(f"Invalid record schema at line {line_number}.")
+                if not isinstance(record["user_message"], str) or not isinstance(
+                    record["assistant_response"], str
+                ):
+                    raise DatasetError(
+                        f"Non-string conversation text at line {line_number}."
+                    )
+                if record["user_message"] in conversations:
+                    raise DatasetError(
+                        f"Duplicate user_message at line {line_number}: "
+                        f"{record['user_message']!r}"
+                    )
+                try:
+                    record["assistant_response"].encode("utf-8")
+                except UnicodeEncodeError as error:
+                    raise DatasetError(
+                        f"Unencodable response text at line {line_number}."
+                    ) from error
 
-            # Important: do not normalize, alter, or rewrite stored data here.
-            conversations[record["user_message"]] = record["assistant_response"]
+                # Important: do not normalize, alter, or rewrite stored data here.
+                conversations[record["user_message"]] = record["assistant_response"]
+        except UnicodeDecodeError as error:
+            raise DatasetError(
+                f"Data file '{path}' is not valid UTF-8: {error}"
+            ) from error
+        except OSError as error:
+            raise DatasetError(f"Error reading data file '{path}': {error}") from error
+        except MemoryError as error:
+            raise DatasetError(f"Data file '{path}' is too large to read.") from error
+
+    if not conversations:
+        raise DatasetError(f"Data file '{path}' contains no records.")
 
     return conversations
 
@@ -99,14 +131,19 @@ def respond(message: str, conversations: Mapping[str, str] | None = None) -> str
     if conversations is None:
         conversations = {}
 
-    normalized = normalize_live_input(message)
+    return _respond_normalized(normalize_live_input(message), conversations)
 
+
+def _respond_normalized(normalized: str, conversations: Mapping[str, str]) -> str:
+    """Return a response for an already-normalized message."""
     if not normalized:
         return "Please enter a message so I can respond."
     elif normalized in EXIT_COMMANDS:
         return "Goodbye."
     elif normalized in GREETINGS:
-        return "Hello. Ask me a question or describe something you would like help with."
+        return (
+            "Hello. Ask me a question or describe something you would like help with."
+        )
     elif normalized in THANKS:
         return "You are welcome."
     elif normalized in FAREWELLS:
@@ -117,7 +154,9 @@ def respond(message: str, conversations: Mapping[str, str] | None = None) -> str
             "handle basic greetings, thanks, help, and exit commands."
         )
     elif normalized in IDENTITY_QUESTIONS:
-        return "I am a small rule-based chatbot using a separate JSONL conversation file."
+        return (
+            "I am a small rule-based chatbot using a separate JSONL conversation file."
+        )
     elif normalized in conversations:
         # Lookup is exact against the authored, untouched corpus key.
         return conversations[normalized]
@@ -128,27 +167,89 @@ def respond(message: str, conversations: Mapping[str, str] | None = None) -> str
         )
 
 
-def main() -> None:
-    """Run the interactive command-line chatbot."""
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Rule-based chatbot backed by a separate JSONL corpus."
+    )
+    parser.add_argument(
+        "message",
+        nargs="?",
+        help="single message to answer (prefix with '--' if it starts "
+        "with '-'); omit to start an interactive session",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Run the chatbot: one-shot when a message is given, else interactive."""
+    args = _parse_args(argv)
+    for stream in (sys.stdout, sys.stderr):
+        # Replace unencodable output instead of crashing on narrow locales.
+        # Suppressed when the stream is None, closed, or lacks reconfigure.
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            with contextlib.suppress(ValueError, OSError):
+                reconfigure(errors="replace")
     try:
         conversations = load_conversations()
     except DatasetError as error:
-        print(f"Data warning: {error}")
-        print("The chatbot will continue with basic rule-based responses only.")
+        if sys.stderr is not None:
+            print(f"Data warning: {error}", file=sys.stderr)
+            print(
+                "The chatbot will continue with basic rule-based responses only.",
+                file=sys.stderr,
+            )
         conversations = {}
+
+    if args.message is not None:
+        print(respond(args.message, conversations))
+        return
 
     print("Rule-based chatbot ready. Type 'quit' to exit.")
     while True:
         try:
             message = input("You: ")
+            normalized = normalize_live_input(message)
         except (EOFError, KeyboardInterrupt):
             print("\nGoodbye.")
             break
+        except (
+            OSError,
+            RuntimeError,
+            ValueError,
+            AttributeError,
+            MemoryError,
+        ) as error:
+            # Closed/lost/odd stdin, undecodable input, or out of memory
+            # while reading a line all end the session rather than crash.
+            if sys.stderr is not None:
+                print(f"\nInput error: {error}", file=sys.stderr)
+            print("Goodbye.")
+            break
 
-        print(f"Bot: {respond(message, conversations)}")
-        if is_exit_command(message):
+        print(f"Bot: {_respond_normalized(normalized, conversations)}")
+        if normalized in EXIT_COMMANDS:
             break
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+        # stdout is block-buffered on pipes; flush now so a downstream
+        # write failure raises here, inside the handler's reach. stdout
+        # is None when fd 1 was closed at exec; print() no-ops but
+        # flush() would raise AttributeError.
+        if sys.stdout is not None:
+            sys.stdout.flush()
+    except OSError:
+        # Output fd is dead: closed early (dead pipe, `| head`), full
+        # device, or reset socket. Redirect both fds so interpreter
+        # shutdown does not re-raise, then exit cleanly.
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                devnull = os.open(os.devnull, os.O_WRONLY)
+                os.dup2(devnull, stream.fileno())
+                os.close(devnull)
+            except (AttributeError, OSError):
+                pass
+        raise SystemExit(0) from None
