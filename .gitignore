@@ -4,6 +4,9 @@ __pycache__/
 *.log
 validation_*.txt
 
+# Autonomous-maintenance operational state
+.omx/
+
 # Temporary corpus authoring batches and one-time local repair helpers
 batch_*.jsonl
 build_dataset.py
@@ -13,6 +16,3 @@ correct_*.py
 *.zip
 *.corrected.jsonl
 *.case_corrected.jsonl
-
-# Local development metadata
-.git/
